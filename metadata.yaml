@@ -1,0 +1,6 @@
+name: astrbot_plugin_context_undo
+display_name: Context Undo
+desc: 为每次 AI 回复建立编号快照，并按编号回滚当前对话上下文。
+version: 2.1.1
+author: lumingya
+astrbot_version: ">=4.18.2"
