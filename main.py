@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import json
 import re
 import time
@@ -28,21 +30,25 @@ class ContextUndoPlugin(Star):
         r"[。？！!?]?$"
     )
     _UNDO_COMMAND_NAMES = {"undoctx", "撤回上下文", "回滚上下文"}
-    _CLEAR_STACK_COMMANDS = {
-        "/reset",
-        "reset",
-        "/del",
-        "del",
-        "/delete",
-        "delete",
-    }
+    _CLEAR_STACK_COMMAND_PATTERN = re.compile(
+        r"(?P<command>/?(?:reset|del|delete))\s*[。？！!?]?",
+        re.IGNORECASE,
+    )
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
+        self._conversation_locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def _now_ts() -> int:
         return int(time.time())
+
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return default
 
     def _stack_key(self, umo: str, conversation_id: str) -> str:
         return f"{self._STACK_KEY_PREFIX}{umo}::{conversation_id}"
@@ -52,6 +58,27 @@ class ContextUndoPlugin(Star):
 
     def _ltm_state_key(self, umo: str, conversation_id: str) -> str:
         return f"{self._LTM_STATE_KEY_PREFIX}{umo}::{conversation_id}"
+
+    def _get_conversation_lock(
+        self,
+        umo: str,
+        conversation_id: str,
+    ) -> asyncio.Lock:
+        key = f"{umo}::{conversation_id}"
+        lock = self._conversation_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._conversation_locks[key] = lock
+        return lock
+
+    @classmethod
+    def _match_clear_stack_command(cls, message_text: str) -> str | None:
+        match = cls._CLEAR_STACK_COMMAND_PATTERN.fullmatch(
+            (message_text or "").strip()
+        )
+        if not match:
+            return None
+        return match.group("command").lstrip("/").lower()
 
     @staticmethod
     def _coerce_history(raw_history) -> list[dict]:
@@ -67,7 +94,7 @@ class ContextUndoPlugin(Star):
         if not isinstance(raw_history, list):
             return []
 
-        return [item for item in raw_history if isinstance(item, dict)]
+        return [copy.deepcopy(item) for item in raw_history if isinstance(item, dict)]
 
     @staticmethod
     def _coerce_string_list(raw_records) -> list[str]:
@@ -101,9 +128,9 @@ class ContextUndoPlugin(Star):
             if not isinstance(item, dict):
                 continue
 
-            turn_id = int(item.get("turn_id", 0) or 0)
+            turn_id = self._safe_int(item.get("turn_id", 0), 0)
             conversation_id = str(item.get("conversation_id", "") or "").strip()
-            created_at = int(item.get("created_at", 0) or 0)
+            created_at = self._safe_int(item.get("created_at", 0), 0)
             if turn_id <= 0 or not conversation_id:
                 continue
 
@@ -151,7 +178,9 @@ class ContextUndoPlugin(Star):
             raw_stack = []
 
         cleaned_stack = self._clean_turn_stack(raw_stack)
-        if len(cleaned_stack) != len(raw_stack):
+        if not isinstance(raw_stack, list):
+            await self._save_turn_stack(umo, conversation_id, cleaned_stack)
+        elif len(cleaned_stack) != len(raw_stack):
             await self._save_turn_stack(umo, conversation_id, cleaned_stack)
         return cleaned_stack
 
@@ -377,8 +406,9 @@ class ContextUndoPlugin(Star):
         if text:
             return self._clip_preview(text)
 
-        if resp.tools_call_name:
-            return self._clip_preview("[工具调用] " + ", ".join(resp.tools_call_name))
+        tool_names = self._coerce_tool_names(getattr(resp, "tools_call_name", None))
+        if tool_names:
+            return self._clip_preview("[工具调用] " + ", ".join(tool_names))
 
         if resp.result_chain:
             return "[非文本回复]"
@@ -387,6 +417,22 @@ class ContextUndoPlugin(Star):
             return "[工具调用]"
 
         return "[空响应]"
+
+    @staticmethod
+    def _coerce_tool_names(raw_names) -> list[str]:
+        if isinstance(raw_names, str):
+            name = raw_names.strip()
+            return [name] if name else []
+
+        if isinstance(raw_names, (list, tuple, set)):
+            names: list[str] = []
+            for item in raw_names:
+                name = str(item).strip()
+                if name:
+                    names.append(name)
+            return names
+
+        return []
 
     async def _build_pending_turn(
         self,
@@ -398,19 +444,21 @@ class ContextUndoPlugin(Star):
         if not conversation_id:
             return None
 
-        await self._sync_conversation_ltm_state(event, conversation_id)
-        history_before = self._coerce_history(getattr(conversation, "history", None))
-        stack = await self._load_turn_stack(event.unified_msg_origin, conversation_id)
-        if not history_before:
-            stack = []
-            await self._save_turn_stack(
-                event.unified_msg_origin,
-                conversation_id,
-                [],
-            )
+        async with self._get_conversation_lock(
+            event.unified_msg_origin,
+            conversation_id,
+        ):
+            await self._sync_conversation_ltm_state(event, conversation_id)
+            history_before = self._coerce_history(getattr(conversation, "history", None))
+            if not history_before:
+                await self._save_turn_stack(
+                    event.unified_msg_origin,
+                    conversation_id,
+                    [],
+                )
+            ltm_records = self._get_ltm_records_before_turn(event)
 
         pending_turn = {
-            "turn_id": (stack[-1]["turn_id"] + 1) if stack else 1,
             "conversation_id": conversation_id,
             "history_before": history_before,
             "user_text": self._build_user_preview(event, req),
@@ -418,7 +466,6 @@ class ContextUndoPlugin(Star):
             "created_at": self._now_ts(),
         }
 
-        ltm_records = self._get_ltm_records_before_turn(event)
         if ltm_records is not None:
             pending_turn["ltm_records_before"] = ltm_records
 
@@ -431,13 +478,6 @@ class ContextUndoPlugin(Star):
             and resp.role == "assistant"
             and (resp.completion_text or resp.result_chain or resp.tools_call_args)
         )
-
-    @staticmethod
-    def _extract_command_token(message_text: str) -> str:
-        text = (message_text or "").strip()
-        if not text:
-            return ""
-        return text.split(maxsplit=1)[0].lower()
 
     def _extract_command_payload(self, message_text: str) -> str:
         text = (message_text or "").strip()
@@ -544,27 +584,26 @@ class ContextUndoPlugin(Star):
         if not conversation_id:
             return "当前没有可撤回的会话。"
 
-        stack = await self._get_current_turn_stack(umo, conversation_id)
+        async with self._get_conversation_lock(umo, conversation_id):
+            stack = await self._get_current_turn_stack(umo, conversation_id)
         if not stack:
             return "当前对话没有可撤回的已编号上下文。"
 
         return self._format_turn_list_text(stack)
 
-    async def _rollback_to_turn(self, event: AstrMessageEvent, turn_id: int) -> str:
-        if turn_id <= 0:
-            return "编号必须大于 0。"
-
-        umo = event.unified_msg_origin
-        conv_mgr = self.context.conversation_manager
-        conversation_id = await conv_mgr.get_curr_conversation_id(umo)
-        if not conversation_id:
-            return "当前没有可撤回的会话。"
-
+    async def _rollback_from_stack(
+        self,
+        event: AstrMessageEvent,
+        conv_mgr,
+        umo: str,
+        conversation_id: str,
+        stack: list[dict],
+        turn_id: int,
+    ) -> tuple[list[dict], int] | str:
         conversation = await conv_mgr.get_conversation(umo, conversation_id)
         if not conversation:
             return "当前会话不存在，无法撤回。"
 
-        stack = await self._get_current_turn_stack(umo, conversation_id)
         if not stack:
             return "当前对话没有可撤回的已编号上下文。"
 
@@ -592,15 +631,40 @@ class ContextUndoPlugin(Star):
 
         remaining_stack = [entry for entry in stack if entry["turn_id"] < turn_id]
         await self._save_turn_stack(umo, conversation_id, remaining_stack)
+        return removed_entries, turn_id
+
+    async def _rollback_to_turn(self, event: AstrMessageEvent, turn_id: int) -> str:
+        if turn_id <= 0:
+            return "编号必须大于 0。"
+
+        umo = event.unified_msg_origin
+        conv_mgr = self.context.conversation_manager
+        conversation_id = await conv_mgr.get_curr_conversation_id(umo)
+        if not conversation_id:
+            return "当前没有可撤回的会话。"
+
+        async with self._get_conversation_lock(umo, conversation_id):
+            stack = await self._get_current_turn_stack(umo, conversation_id)
+            result = await self._rollback_from_stack(
+                event,
+                conv_mgr,
+                umo,
+                conversation_id,
+                stack,
+                turn_id,
+            )
+        if isinstance(result, str):
+            return result
+        removed_entries, target_turn_id = result
 
         logger.info(
             "Context undo restored snapshot for %s: cid=%s target_turn=%s removed=%s",
             umo,
             conversation_id,
-            turn_id,
+            target_turn_id,
             len(removed_entries),
         )
-        return self._format_rollback_result(removed_entries, turn_id)
+        return self._format_rollback_result(removed_entries, target_turn_id)
 
     async def _rollback_latest_count(
         self,
@@ -616,13 +680,33 @@ class ContextUndoPlugin(Star):
         if not conversation_id:
             return "当前没有可撤回的会话。"
 
-        stack = await self._get_current_turn_stack(umo, conversation_id)
-        if not stack:
-            return "当前对话没有可撤回的已编号上下文。"
+        async with self._get_conversation_lock(umo, conversation_id):
+            stack = await self._get_current_turn_stack(umo, conversation_id)
+            if not stack:
+                return "当前对话没有可撤回的已编号上下文。"
 
-        actual_count = min(count, len(stack))
-        target_turn_id = stack[-actual_count]["turn_id"]
-        return await self._rollback_to_turn(event, target_turn_id)
+            actual_count = min(count, len(stack))
+            target_turn_id = stack[-actual_count]["turn_id"]
+            result = await self._rollback_from_stack(
+                event,
+                conv_mgr,
+                umo,
+                conversation_id,
+                stack,
+                target_turn_id,
+            )
+        if isinstance(result, str):
+            return result
+        removed_entries, target_turn_id = result
+
+        logger.info(
+            "Context undo restored snapshot for %s: cid=%s target_turn=%s removed=%s",
+            umo,
+            conversation_id,
+            target_turn_id,
+            len(removed_entries),
+        )
+        return self._format_rollback_result(removed_entries, target_turn_id)
 
     async def _handle_undo_request(
         self,
@@ -641,6 +725,7 @@ class ContextUndoPlugin(Star):
         return self._build_usage_text()
 
     async def _send_plain_result(self, event: AstrMessageEvent, result_text: str) -> None:
+        # AstrBot 里传 True 表示禁止默认 LLM 链路继续执行。
         event.should_call_llm(True)
         event.set_extra("skip_history_save", True)
         await event.send(event.plain_result(result_text))
@@ -659,19 +744,23 @@ class ContextUndoPlugin(Star):
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL, priority=1000)
     async def watch_session_management_commands(self, event: AstrMessageEvent):
-        command_token = self._extract_command_token(event.message_str)
-        if command_token in self._CLEAR_STACK_COMMANDS:
+        clear_command = self._match_clear_stack_command(event.message_str)
+        if clear_command:
             event.set_extra(self._SKIP_LTM_SYNC_EXTRA, True)
             conversation_id = await self.context.conversation_manager.get_curr_conversation_id(
                 event.unified_msg_origin
             )
             if conversation_id:
-                await self._clear_turn_stack(
+                async with self._get_conversation_lock(
                     event.unified_msg_origin,
                     conversation_id,
-                    command_token,
-                )
-                await self._clear_ltm_state(event, conversation_id, command_token)
+                ):
+                    await self._clear_turn_stack(
+                        event.unified_msg_origin,
+                        conversation_id,
+                        clear_command,
+                    )
+                    await self._clear_ltm_state(event, conversation_id, clear_command)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL, priority=-1000)
     async def sync_live_ltm_state(self, event: AstrMessageEvent):
@@ -685,7 +774,11 @@ class ContextUndoPlugin(Star):
         if not conversation_id:
             return
 
-        await self._sync_conversation_ltm_state(event, conversation_id)
+        async with self._get_conversation_lock(
+            event.unified_msg_origin,
+            conversation_id,
+        ):
+            await self._sync_conversation_ltm_state(event, conversation_id)
 
     @filter.on_llm_request(priority=1000)
     async def record_pending_turn(
@@ -710,28 +803,36 @@ class ContextUndoPlugin(Star):
         if not self._response_is_undoable(resp):
             return
 
+        pending_turn = copy.deepcopy(pending_turn)
         pending_turn["assistant_text"] = self._build_assistant_preview(resp)
-        ltm_records_after = self._get_current_ltm_records(event)
-        if ltm_records_after is not None:
-            pending_turn["ltm_records_after"] = ltm_records_after
 
-        stack = await self._get_current_turn_stack(
+        async with self._get_conversation_lock(
             event.unified_msg_origin,
             pending_turn["conversation_id"],
-        )
-        stack = [entry for entry in stack if entry["turn_id"] < pending_turn["turn_id"]]
-        stack.append(pending_turn)
-        await self._save_turn_stack(
-            event.unified_msg_origin,
-            pending_turn["conversation_id"],
-            stack,
-        )
-        if ltm_records_after is not None:
-            await self._save_ltm_state(
+        ):
+            ltm_records_after = self._get_current_ltm_records(event)
+            if ltm_records_after is not None:
+                pending_turn["ltm_records_after"] = ltm_records_after
+
+            stack = await self._get_current_turn_stack(
                 event.unified_msg_origin,
                 pending_turn["conversation_id"],
-                ltm_records_after,
             )
+            if not pending_turn.get("history_before"):
+                stack = []
+            pending_turn["turn_id"] = (stack[-1]["turn_id"] + 1) if stack else 1
+            stack.append(pending_turn)
+            await self._save_turn_stack(
+                event.unified_msg_origin,
+                pending_turn["conversation_id"],
+                stack,
+            )
+            if ltm_records_after is not None:
+                await self._save_ltm_state(
+                    event.unified_msg_origin,
+                    pending_turn["conversation_id"],
+                    ltm_records_after,
+                )
 
         logger.info(
             "Context undo checkpoint saved for %s: cid=%s turn_id=%s stack=%s",
