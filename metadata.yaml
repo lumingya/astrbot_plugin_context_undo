@@ -1,6 +1,6 @@
 name: astrbot_plugin_context_undo
 display_name: 上下文撤回
-desc: 为每次 AI 回复建立编号快照，并按编号回滚当前对话上下文。
+desc: 撤回最近一次或多次的ai回复上下文，避免ai被不良信息影响。
 help: 聊天中发送“撤回”“撤回列表”“撤回 #3”“撤回 最近 2”，也支持 /undoctx list、/undoctx 3、/undoctx last 2；仅管理员可用。
 version: 2.1.1
 author: lumingya
