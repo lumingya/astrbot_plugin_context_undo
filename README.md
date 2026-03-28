@@ -80,7 +80,7 @@
 - 插件名：`astrbot_plugin_context_undo`
 - 显示名：`Context Undo`
 - 作者：`lumingya`
-- 适用 AstrBot 版本：`>= 4.18.2`
+- 适用 AstrBot 版本：`v4.12.3，其它版本不知道`
 
 ## 一句话总结
 
