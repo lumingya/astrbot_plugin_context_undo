@@ -149,6 +149,11 @@ class ContextUndoPlugin(Star):
                 "created_at": created_at or now_ts,
             }
 
+            # 保留 session_variables 快照（v2.1.2+）
+            session_vars = item.get("session_variables_before")
+            if session_vars is not None:
+                entry["session_variables_before"] = copy.deepcopy(session_vars)
+
             if cleaned_stack and cleaned_stack[-1]["conversation_id"] != conversation_id:
                 cleaned_stack = []
 
@@ -365,17 +370,33 @@ class ContextUndoPlugin(Star):
         else:
             session_chats.pop(event.unified_msg_origin, None)
 
-    async def _clear_related_session_state(self, event: AstrMessageEvent) -> None:
+    async def _restore_or_clear_session_state(
+        self,
+        event: AstrMessageEvent,
+        session_vars_snapshot,
+    ) -> None:
         umo = event.unified_msg_origin
 
-        try:
-            await sp.session_remove(umo, "session_variables")
-        except Exception as exc:
-            logger.warning(
-                "Context undo failed to clear session_variables for %s: %s",
-                umo,
-                exc,
-            )
+        if session_vars_snapshot is not None:
+            try:
+                await sp.session_put(
+                    umo, "session_variables", session_vars_snapshot
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Context undo failed to restore session_variables for %s: %s",
+                    umo,
+                    exc,
+                )
+        else:
+            try:
+                await sp.session_remove(umo, "session_variables")
+            except Exception as exc:
+                logger.warning(
+                    "Context undo failed to clear session_variables for %s: %s",
+                    umo,
+                    exc,
+                )
 
         worldbook_meta = self.context.get_registered_star("astrbot_plugin_worldbook")
         worldbook = worldbook_meta.star_cls if worldbook_meta else None
@@ -468,6 +489,18 @@ class ContextUndoPlugin(Star):
 
         if ltm_records is not None:
             pending_turn["ltm_records_before"] = ltm_records
+
+        # 快照当前 session_variables，以便回滚时恢复
+        try:
+            session_vars = await sp.session_get(
+                event.unified_msg_origin, "session_variables"
+            )
+            if session_vars is not None:
+                pending_turn["session_variables_before"] = copy.deepcopy(
+                    session_vars
+                )
+        except Exception:
+            pass
 
         return pending_turn
 
@@ -627,7 +660,11 @@ class ContextUndoPlugin(Star):
         )
         self._restore_ltm_records(event, restored_ltm_records)
         await self._save_ltm_state(umo, conversation_id, restored_ltm_records)
-        await self._clear_related_session_state(event)
+
+        # 恢复 session_variables 到快照点，同时清除 worldbook
+        await self._restore_or_clear_session_state(
+            event, target_entry.get("session_variables_before")
+        )
 
         remaining_stack = [entry for entry in stack if entry["turn_id"] < turn_id]
         await self._save_turn_stack(umo, conversation_id, remaining_stack)
@@ -728,6 +765,8 @@ class ContextUndoPlugin(Star):
         # AstrBot 里传 True 表示禁止默认 LLM 链路继续执行。
         event.should_call_llm(True)
         event.set_extra("skip_history_save", True)
+        # 阻止 sync_live_ltm_state 把本命令文本写入 LTM
+        event.set_extra(self._SKIP_LTM_SYNC_EXTRA, True)
         await event.send(event.plain_result(result_text))
 
     async def _ensure_admin(self, event: AstrMessageEvent) -> bool:
